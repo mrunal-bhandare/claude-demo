@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>ServerMonitorConsole</RootNamespace>
     <AssemblyName>ServerMonitor</AssemblyName>
-    <!-- Self-contained single exe: dotnet publish -c Release -r win-x64 --self-contained -->
+
   </PropertyGroup>
 
   <ItemGroup>
