@@ -1,145 +1,167 @@
 /*
  * ============================================================
- *  SERVER MONITOR — Console Application
+ *  SERVER MONITOR - Console Application
  *  .NET 8  |  SQL Server  |  Task Scheduler friendly
  * ============================================================
  *
  *  HOW IT WORKS:
- *  Run this exe once (via Task Scheduler every N minutes).
+ *  Run this exe once via Windows Task Scheduler every N minutes.
  *  It checks every server in appsettings.json, writes results
  *  to SQL Server, and sends email alerts when a server is DOWN
- *  or has RECOVERED.  Then it exits cleanly.
+ *  or has RECOVERED. Then it exits cleanly.
  *
  *  TASK SCHEDULER SETUP:
- *    Action : Start a program
+ *    Action  : Start a program
  *    Program : C:\ServerMonitor\ServerMonitor.exe
- *    Trigger : Every 5 minutes (or whatever interval you want)
+ *    Trigger : Every 5 minutes (or your preferred interval)
  *
  *  PUBLISH AS SINGLE EXE:
- *    dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+ *    dotnet publish -c Release -r win-x64 --self-contained
  * ============================================================
  */
 
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
-using System.Text;
 using System.Text.Json;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using Microsoft.Data.SqlClient;
 using MimeKit;
 
-// ── Load config ──────────────────────────────────────────────────────────────
-var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
-if (!File.Exists(configPath))
+internal class Program
 {
-    Console.Error.WriteLine($"[ERROR] appsettings.json not found at: {configPath}");
-    return 2;
-}
-
-AppConfig config;
-try
-{
-    var json = await File.ReadAllTextAsync(configPath);
-    config = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
+    static async Task Main(string[] args)
     {
-        PropertyNameCaseInsensitive = true
-    }) ?? throw new Exception("Config deserialized as null.");
-}
-catch (Exception ex)
-{
-    Console.Error.WriteLine($"[ERROR] Failed to read appsettings.json: {ex.Message}");
-    return 2;
-}
+        // ── Load config ───────────────────────────────────────────────────────
+        var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+        if (!File.Exists(configPath))
+        {
+            Console.Error.WriteLine($"[ERROR] appsettings.json not found at: {configPath}");
+            Environment.Exit(2);
+            return;
+        }
 
-// ── Bootstrap DB ─────────────────────────────────────────────────────────────
-var db = new Database(config.ConnectionString);
-await db.EnsureTablesCreatedAsync();
+        AppConfig config;
+        try
+        {
+            var json = await File.ReadAllTextAsync(configPath);
+            config = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            }) ?? throw new Exception("Config is null after deserialization.");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] Failed to read appsettings.json: {ex.Message}");
+            Environment.Exit(2);
+            return;
+        }
 
-// ── Log file (same folder as exe) ────────────────────────────────────────────
-var logPath = Path.Combine(AppContext.BaseDirectory, "Logs",
-    $"servermonitor-{DateTime.Now:yyyy-MM-dd}.log");
-Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+        // ── Log file setup ────────────────────────────────────────────────────
+        var logDir  = Path.Combine(AppContext.BaseDirectory, "Logs");
+        var logPath = Path.Combine(logDir, $"servermonitor-{DateTime.Now:yyyy-MM-dd}.log");
+        Directory.CreateDirectory(logDir);
 
-void Log(string level, string message)
-{
-    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}";
-    Console.WriteLine(line);
-    try { File.AppendAllText(logPath, line + Environment.NewLine); }
-    catch { /* log write failure is non-fatal */ }
-}
+        void Log(string level, string message)
+        {
+            var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}";
+            Console.WriteLine(line);
+            try { File.AppendAllText(logPath, line + Environment.NewLine); } catch { }
+        }
 
-Log("INFO", "========== Server Monitor Run Started ==========");
+        Log("INFO", "========== Server Monitor Run Started ==========");
 
-// ── Check each server ────────────────────────────────────────────────────────
-var checker  = new ServerChecker(Log);
-var mailer   = new EmailSender(config.Email, Log);
-int exitCode = 0;
+        // ── Bootstrap DB ──────────────────────────────────────────────────────
+        var db = new Database(config.ConnectionString, Log);
+        try
+        {
+            await db.EnsureTablesCreatedAsync();
+        }
+        catch (Exception ex)
+        {
+            Log("ERROR", $"Database connection failed: {ex.Message}");
+            Log("ERROR", "Check your ConnectionString in appsettings.json");
+            Environment.Exit(2);
+            return;
+        }
 
-foreach (var server in config.Servers)
-{
-    Log("INFO", $"Checking [{server.Name}] {server.Protocol}://{server.Host}:{server.Port}");
+        // ── Check each server ─────────────────────────────────────────────────
+        var checker  = new ServerChecker(Log);
+        var mailer   = new EmailSender(config.Email, Log);
+        int exitCode = 0;
 
-    // 1. Perform the check
-    var result = await checker.CheckAsync(server);
+        foreach (var server in config.Servers)
+        {
+            Log("INFO", $"Checking [{server.Name}] {server.Protocol}://{server.Host}:{server.Port}");
 
-    Log(result.IsUp ? "INFO" : "WARN",
-        $"  → Status: {(result.IsUp ? "UP" : "DOWN")} | " +
-        $"ResponseTime: {result.ResponseTimeMs}ms" +
-        (result.ErrorMessage != null ? $" | Error: {result.ErrorMessage}" : ""));
+            // 1. Perform the check
+            var result = await checker.CheckAsync(server);
 
-    // 2. Save result to DB
-    await db.SaveCheckResultAsync(server.Name, server.Host, server.Port,
-        server.Protocol, result);
+            Log(result.IsUp ? "INFO" : "WARN",
+                $"  Status: {(result.IsUp ? "UP" : "DOWN")} | " +
+                $"ResponseTime: {result.ResponseTimeMs}ms" +
+                (result.ErrorMessage != null ? $" | Error: {result.ErrorMessage}" : ""));
 
-    // 3. Evaluate alert logic
-    var state = await db.GetServerStateAsync(server.Name, server.Host, server.Port);
+            // 2. Save result to DB
+            await db.SaveCheckResultAsync(server.Name, server.Host, server.Port, server.Protocol, result);
 
-    bool shouldAlertDown     = !result.IsUp
-                               && state.ConsecutiveFailures >= server.FailureThreshold
-                               && !state.AlertSentForCurrentOutage;
+            // 3. Get current server state
+            var state = await db.GetServerStateAsync(server.Name, server.Host, server.Port);
 
-    bool shouldAlertRecovery = result.IsUp
-                               && state.WasPreviouslyDown
-                               && state.AlertSentForCurrentOutage;
+            bool shouldAlertDown     = !result.IsUp
+                                       && state.ConsecutiveFailures >= server.FailureThreshold
+                                       && !state.AlertSentForCurrentOutage;
 
-    // 4. Send DOWN alert
-    if (shouldAlertDown)
-    {
-        Log("WARN", $"  → Threshold reached ({state.ConsecutiveFailures} failures). Sending DOWN alert...");
-        bool sent = await mailer.SendDownAlertAsync(server, result);
-        await db.UpdateAlertSentAsync(server.Name, server.Host, server.Port,
-            alertSent: true, recovered: false);
-        if (!sent) exitCode = 1;
+            bool shouldAlertRecovery = result.IsUp
+                                       && state.WasPreviouslyDown
+                                       && state.AlertSentForCurrentOutage;
+
+            // 4. Send DOWN alert
+            if (shouldAlertDown)
+            {
+                Log("WARN", $"  Threshold reached ({state.ConsecutiveFailures} failures). Sending DOWN alert...");
+                bool sent = await mailer.SendDownAlertAsync(server, result);
+                await db.UpdateAlertSentAsync(server.Name, server.Host, server.Port, alertSent: true, recovered: false);
+                if (!sent) exitCode = 1;
+            }
+
+            // 5. Send RECOVERY alert
+            else if (shouldAlertRecovery)
+            {
+                var downtime = state.OutageStartedAt.HasValue
+                    ? DateTime.UtcNow - state.OutageStartedAt.Value
+                    : TimeSpan.Zero;
+
+                Log("INFO", $"  Server recovered after {downtime.TotalMinutes:F0} min. Sending RECOVERY alert...");
+                bool sent = await mailer.SendRecoveryAlertAsync(server, result, downtime);
+                await db.UpdateAlertSentAsync(server.Name, server.Host, server.Port, alertSent: false, recovered: true);
+                if (!sent) exitCode = 1;
+            }
+        }
+
+        Log("INFO", "========== Server Monitor Run Completed ==========");
+
+        // Keep console open when running from Visual Studio (not Task Scheduler)
+        if (System.Diagnostics.Debugger.IsAttached)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Press any key to exit...");
+            Console.ReadKey();
+        }
+
+        Environment.Exit(exitCode);
     }
-
-    // 5. Send RECOVERY alert
-    else if (shouldAlertRecovery)
-    {
-        var downtime = state.OutageStartedAt.HasValue
-            ? DateTime.UtcNow - state.OutageStartedAt.Value
-            : TimeSpan.Zero;
-
-        Log("INFO", $"  → Server recovered after {downtime.TotalMinutes:F0} min. Sending RECOVERY alert...");
-        bool sent = await mailer.SendRecoveryAlertAsync(server, result, downtime);
-        await db.UpdateAlertSentAsync(server.Name, server.Host, server.Port,
-            alertSent: false, recovered: true);
-        if (!sent) exitCode = 1;
-    }
 }
 
-Log("INFO", "========== Server Monitor Run Completed ==========");
-return exitCode;
 
-
-// ═══════════════════════════════════════════════════════════════════════════════
+// =============================================================================
 // CONFIG MODELS
-// ═══════════════════════════════════════════════════════════════════════════════
+// =============================================================================
 
 public class AppConfig
 {
-    public string ConnectionString { get; set; } = string.Empty;
-    public EmailConfig Email       { get; set; } = new();
+    public string ConnectionString    { get; set; } = string.Empty;
+    public EmailConfig Email          { get; set; } = new();
     public List<ServerConfig> Servers { get; set; } = new();
 }
 
@@ -159,33 +181,33 @@ public class ServerConfig
     public string  Name             { get; set; } = string.Empty;
     public string  Host             { get; set; } = string.Empty;
     public int     Port             { get; set; } = 80;
-    public string  Protocol        { get; set; } = "HTTP";
-    public string? HealthCheckUrl  { get; set; }
-    public int     TimeoutSeconds  { get; set; } = 10;
+    public string  Protocol         { get; set; } = "HTTP";
+    public string? HealthCheckUrl   { get; set; }
+    public int     TimeoutSeconds   { get; set; } = 10;
     public int     FailureThreshold { get; set; } = 3;
 }
 
 public class CheckResult
 {
-    public bool   IsUp           { get; set; }
-    public int    ResponseTimeMs { get; set; }
-    public int?   HttpStatusCode { get; set; }
-    public string? ErrorMessage  { get; set; }
-    public DateTime CheckedAt   { get; set; } = DateTime.UtcNow;
+    public bool    IsUp           { get; set; }
+    public int     ResponseTimeMs { get; set; }
+    public int?    HttpStatusCode { get; set; }
+    public string? ErrorMessage   { get; set; }
+    public DateTime CheckedAt    { get; set; } = DateTime.UtcNow;
 }
 
 public class ServerState
 {
-    public int       ConsecutiveFailures      { get; set; }
-    public bool      WasPreviouslyDown        { get; set; }
+    public int       ConsecutiveFailures       { get; set; }
+    public bool      WasPreviouslyDown         { get; set; }
     public bool      AlertSentForCurrentOutage { get; set; }
-    public DateTime? OutageStartedAt          { get; set; }
+    public DateTime? OutageStartedAt           { get; set; }
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SERVER CHECKER  — HTTP / HTTPS / TCP / ICMP
-// ═══════════════════════════════════════════════════════════════════════════════
+// =============================================================================
+// SERVER CHECKER  -  HTTP / HTTPS / TCP / ICMP
+// =============================================================================
 
 public class ServerChecker
 {
@@ -220,16 +242,16 @@ public class ServerChecker
 
     private async Task<CheckResult> CheckHttpAsync(ServerConfig server)
     {
-        var sw      = System.Diagnostics.Stopwatch.StartNew();
-        var scheme  = server.Protocol.ToLower();
-        var url     = string.IsNullOrWhiteSpace(server.HealthCheckUrl)
+        var sw     = System.Diagnostics.Stopwatch.StartNew();
+        var scheme = server.Protocol.ToLower();
+        var url    = string.IsNullOrWhiteSpace(server.HealthCheckUrl)
             ? $"{scheme}://{server.Host}:{server.Port}/"
             : $"{scheme}://{server.Host}:{server.Port}{server.HealthCheckUrl}";
 
         using var handler = new HttpClientHandler
         {
-            // Accept self-signed certs on internal servers
-            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+            ServerCertificateCustomValidationCallback =
+                HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
         };
         using var client = new HttpClient(handler)
         {
@@ -274,44 +296,48 @@ public class ServerChecker
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// DATABASE  — SQL Server (no EF Core, plain ADO.NET)
-// ═══════════════════════════════════════════════════════════════════════════════
+// =============================================================================
+// DATABASE  -  SQL Server plain ADO.NET (no EF Core)
+// =============================================================================
 
 public class Database
 {
     private readonly string _connStr;
+    private readonly Action<string, string> _log;
 
-    public Database(string connectionString) => _connStr = connectionString;
+    public Database(string connectionString, Action<string, string> log)
+    {
+        _connStr = connectionString;
+        _log     = log;
+    }
 
-    // ── Create tables if they don't exist ────────────────────────────────────
     public async Task EnsureTablesCreatedAsync()
     {
-        const string sql = """
+        const string sql = @"
             IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SM_CheckLog' AND xtype='U')
             CREATE TABLE SM_CheckLog (
-                Id               BIGINT IDENTITY(1,1) PRIMARY KEY,
-                ServerName       NVARCHAR(200)  NOT NULL,
-                Host             NVARCHAR(500)  NOT NULL,
-                Port             INT            NOT NULL,
-                Protocol         NVARCHAR(10)   NOT NULL,
-                IsUp             BIT            NOT NULL,
-                ResponseTimeMs   INT            NOT NULL,
-                HttpStatusCode   INT            NULL,
-                ErrorMessage     NVARCHAR(2000) NULL,
-                CheckedAt        DATETIME2      NOT NULL DEFAULT GETUTCDATE()
+                Id             BIGINT IDENTITY(1,1) PRIMARY KEY,
+                ServerName     NVARCHAR(200)  NOT NULL,
+                Host           NVARCHAR(500)  NOT NULL,
+                Port           INT            NOT NULL,
+                Protocol       NVARCHAR(10)   NOT NULL,
+                IsUp           BIT            NOT NULL,
+                ResponseTimeMs INT            NOT NULL,
+                HttpStatusCode INT            NULL,
+                ErrorMessage   NVARCHAR(2000) NULL,
+                CheckedAt      DATETIME2      NOT NULL DEFAULT GETUTCDATE()
             );
 
             IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SM_ServerState' AND xtype='U')
             CREATE TABLE SM_ServerState (
-                Id                       INT IDENTITY(1,1) PRIMARY KEY,
-                ServerName               NVARCHAR(200) NOT NULL,
-                Host                     NVARCHAR(500) NOT NULL,
-                Port                     INT           NOT NULL,
-                ConsecutiveFailures      INT           NOT NULL DEFAULT 0,
-                AlertSentForCurrentOutage BIT          NOT NULL DEFAULT 0,
-                OutageStartedAt          DATETIME2     NULL,
-                LastCheckedAt            DATETIME2     NULL,
+                Id                        INT IDENTITY(1,1) PRIMARY KEY,
+                ServerName                NVARCHAR(200) NOT NULL,
+                Host                      NVARCHAR(500) NOT NULL,
+                Port                      INT           NOT NULL,
+                ConsecutiveFailures       INT           NOT NULL DEFAULT 0,
+                AlertSentForCurrentOutage BIT           NOT NULL DEFAULT 0,
+                OutageStartedAt           DATETIME2     NULL,
+                LastCheckedAt             DATETIME2     NULL,
                 CONSTRAINT UQ_SM_ServerState UNIQUE (ServerName, Host, Port)
             );
 
@@ -325,34 +351,32 @@ public class Database
                 IsSent       BIT            NOT NULL,
                 ErrorMessage NVARCHAR(2000) NULL,
                 SentAt       DATETIME2      NOT NULL DEFAULT GETUTCDATE()
-            );
-            """;
+            );";
 
         await using var conn = new SqlConnection(_connStr);
         await conn.OpenAsync();
         await using var cmd = new SqlCommand(sql, conn);
         await cmd.ExecuteNonQueryAsync();
+        _log("INFO", "Database tables verified.");
     }
 
-    // ── Save a check result ───────────────────────────────────────────────────
     public async Task SaveCheckResultAsync(string name, string host, int port,
         string protocol, CheckResult result)
     {
-        const string sql = """
+        const string sql = @"
             INSERT INTO SM_CheckLog
                 (ServerName, Host, Port, Protocol, IsUp, ResponseTimeMs, HttpStatusCode, ErrorMessage, CheckedAt)
             VALUES
                 (@Name, @Host, @Port, @Protocol, @IsUp, @Ms, @Http, @Err, @At);
 
-            -- Upsert state row
             IF EXISTS (SELECT 1 FROM SM_ServerState WHERE ServerName=@Name AND Host=@Host AND Port=@Port)
                 UPDATE SM_ServerState SET
-                    ConsecutiveFailures      = CASE WHEN @IsUp=1 THEN 0 ELSE ConsecutiveFailures+1 END,
+                    ConsecutiveFailures       = CASE WHEN @IsUp=1 THEN 0 ELSE ConsecutiveFailures+1 END,
                     AlertSentForCurrentOutage = CASE WHEN @IsUp=1 THEN 0 ELSE AlertSentForCurrentOutage END,
                     OutageStartedAt           = CASE
-                                                  WHEN @IsUp=0 AND ConsecutiveFailures=0 THEN @At
-                                                  WHEN @IsUp=1 THEN NULL
-                                                  ELSE OutageStartedAt
+                                                    WHEN @IsUp=0 AND ConsecutiveFailures=0 THEN @At
+                                                    WHEN @IsUp=1 THEN NULL
+                                                    ELSE OutageStartedAt
                                                 END,
                     LastCheckedAt = @At
                 WHERE ServerName=@Name AND Host=@Host AND Port=@Port
@@ -360,9 +384,11 @@ public class Database
                 INSERT INTO SM_ServerState
                     (ServerName, Host, Port, ConsecutiveFailures, AlertSentForCurrentOutage, OutageStartedAt, LastCheckedAt)
                 VALUES
-                    (@Name, @Host, @Port, CASE WHEN @IsUp=1 THEN 0 ELSE 1 END, 0,
-                     CASE WHEN @IsUp=1 THEN NULL ELSE @At END, @At);
-            """;
+                    (@Name, @Host, @Port,
+                     CASE WHEN @IsUp=1 THEN 0 ELSE 1 END,
+                     0,
+                     CASE WHEN @IsUp=1 THEN NULL ELSE @At END,
+                     @At);";
 
         await using var conn = new SqlConnection(_connStr);
         await conn.OpenAsync();
@@ -379,17 +405,20 @@ public class Database
         await cmd.ExecuteNonQueryAsync();
     }
 
-    // ── Get current server state ──────────────────────────────────────────────
     public async Task<ServerState> GetServerStateAsync(string name, string host, int port)
     {
-        const string sql = """
-            SELECT ConsecutiveFailures, AlertSentForCurrentOutage, OutageStartedAt,
-                   (SELECT TOP 1 IsUp FROM SM_CheckLog
-                    WHERE ServerName=@Name AND Host=@Host AND Port=@Port
-                    ORDER BY CheckedAt DESC OFFSET 1 ROWS) AS WasPreviouslyDown
-            FROM SM_ServerState
-            WHERE ServerName=@Name AND Host=@Host AND Port=@Port
-            """;
+        const string sql = @"
+            SELECT
+                s.ConsecutiveFailures,
+                s.AlertSentForCurrentOutage,
+                s.OutageStartedAt,
+                (SELECT TOP 1 IsUp
+                 FROM SM_CheckLog
+                 WHERE ServerName=@Name AND Host=@Host AND Port=@Port
+                 ORDER BY CheckedAt DESC
+                 OFFSET 1 ROWS) AS PreviousIsUp
+            FROM SM_ServerState s
+            WHERE s.ServerName=@Name AND s.Host=@Host AND s.Port=@Port";
 
         await using var conn = new SqlConnection(_connStr);
         await conn.OpenAsync();
@@ -402,28 +431,25 @@ public class Database
         if (!await rdr.ReadAsync())
             return new ServerState();
 
+        bool prevWasDown = !rdr.IsDBNull(3) && rdr.GetBoolean(3) == false;
+
         return new ServerState
         {
             ConsecutiveFailures       = rdr.GetInt32(0),
             AlertSentForCurrentOutage = rdr.GetBoolean(1),
             OutageStartedAt           = rdr.IsDBNull(2) ? null : rdr.GetDateTime(2),
-            WasPreviouslyDown         = !rdr.IsDBNull(3) && rdr.GetBoolean(3) == false
-                                        // previous row was DOWN (IsUp=0)
-                                        ? true
-                                        : (!rdr.IsDBNull(3) && !rdr.GetBoolean(3))
+            WasPreviouslyDown         = prevWasDown
         };
     }
 
-    // ── Flip the alert-sent flag ──────────────────────────────────────────────
     public async Task UpdateAlertSentAsync(string name, string host, int port,
         bool alertSent, bool recovered)
     {
-        const string sql = """
+        const string sql = @"
             UPDATE SM_ServerState SET
                 AlertSentForCurrentOutage = @Sent,
                 OutageStartedAt           = CASE WHEN @Recovered=1 THEN NULL ELSE OutageStartedAt END
-            WHERE ServerName=@Name AND Host=@Host AND Port=@Port
-            """;
+            WHERE ServerName=@Name AND Host=@Host AND Port=@Port";
 
         await using var conn = new SqlConnection(_connStr);
         await conn.OpenAsync();
@@ -435,33 +461,12 @@ public class Database
         cmd.Parameters.AddWithValue("@Recovered", recovered ? 1 : 0);
         await cmd.ExecuteNonQueryAsync();
     }
-
-    // ── Save alert log record ─────────────────────────────────────────────────
-    public async Task SaveAlertLogAsync(string serverName, string alertType,
-        string subject, string recipients, bool isSent, string? error)
-    {
-        const string sql = """
-            INSERT INTO SM_AlertLog (ServerName, AlertType, Subject, Recipients, IsSent, ErrorMessage)
-            VALUES (@Name, @Type, @Subj, @Recip, @Sent, @Err)
-            """;
-
-        await using var conn = new SqlConnection(_connStr);
-        await conn.OpenAsync();
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@Name",  serverName);
-        cmd.Parameters.AddWithValue("@Type",  alertType);
-        cmd.Parameters.AddWithValue("@Subj",  subject);
-        cmd.Parameters.AddWithValue("@Recip", recipients);
-        cmd.Parameters.AddWithValue("@Sent",  isSent ? 1 : 0);
-        cmd.Parameters.AddWithValue("@Err",   (object?)error ?? DBNull.Value);
-        await cmd.ExecuteNonQueryAsync();
-    }
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EMAIL SENDER  — MailKit / SMTP
-// ═══════════════════════════════════════════════════════════════════════════════
+// =============================================================================
+// EMAIL SENDER  -  MailKit / SMTP
+// =============================================================================
 
 public class EmailSender
 {
@@ -476,23 +481,23 @@ public class EmailSender
 
     public async Task<bool> SendDownAlertAsync(ServerConfig server, CheckResult result)
     {
-        var subject = $"🔴 ALERT: {server.Name} is DOWN";
+        var subject = $"ALERT: {server.Name} is DOWN";
         var body    = BuildDownBody(server, result);
-        return await SendAsync(subject, body, server.Name, "DOWN");
+        return await SendAsync(subject, body);
     }
 
     public async Task<bool> SendRecoveryAlertAsync(ServerConfig server, CheckResult result, TimeSpan downtime)
     {
-        var subject = $"✅ RECOVERED: {server.Name} is back UP";
+        var subject = $"RECOVERED: {server.Name} is back UP";
         var body    = BuildRecoveryBody(server, result, downtime);
-        return await SendAsync(subject, body, server.Name, "RECOVERY");
+        return await SendAsync(subject, body);
     }
 
-    private async Task<bool> SendAsync(string subject, string htmlBody, string serverName, string alertType)
+    private async Task<bool> SendAsync(string subject, string htmlBody)
     {
         if (_cfg.Recipients == null || _cfg.Recipients.Count == 0)
         {
-            _log("WARN", "No recipient emails configured — skipping alert.");
+            _log("WARN", "No recipient emails configured. Skipping alert.");
             return false;
         }
 
@@ -502,6 +507,7 @@ public class EmailSender
             message.From.Add(new MailboxAddress(_cfg.SenderName, _cfg.SenderEmail));
             foreach (var r in _cfg.Recipients)
                 message.To.Add(MailboxAddress.Parse(r));
+
             message.Subject = subject;
             message.Body    = new BodyBuilder { HtmlBody = htmlBody }.ToMessageBody();
 
@@ -512,19 +518,17 @@ public class EmailSender
             await smtp.SendAsync(message);
             await smtp.DisconnectAsync(true);
 
-            _log("INFO", $"  → Email sent: {subject}");
+            _log("INFO", $"  Email sent: {subject}");
             return true;
         }
         catch (Exception ex)
         {
-            _log("ERROR", $"  → Failed to send email: {ex.Message}");
+            _log("ERROR", $"  Failed to send email: {ex.Message}");
             return false;
         }
     }
 
-    // ── HTML Templates ────────────────────────────────────────────────────────
-
-    private static string BuildDownBody(ServerConfig server, CheckResult result) => $"""
+    private static string BuildDownBody(ServerConfig server, CheckResult result) => $@"
         <!DOCTYPE html><html><head><style>
           body{{font-family:'Segoe UI',Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px}}
           .card{{background:#fff;border-radius:8px;max-width:580px;margin:auto;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.12)}}
@@ -534,31 +538,30 @@ public class EmailSender
           table{{width:100%;border-collapse:collapse;margin-top:12px}}
           td{{padding:9px 12px;border-bottom:1px solid #eee;font-size:14px}}
           td:first-child{{font-weight:bold;color:#555;width:38%}}
-          .badge{{background:#c0392b;color:#fff;border-radius:4px;padding:3px 9px;font-size:12px;font-weight:bold}}
+          .badge{{background:#c0392b;color:#fff;border-radius:4px;padding:3px 9px;font-size:12px}}
           .note{{margin-top:18px;padding:12px;background:#fef9e7;border-left:4px solid #f39c12;border-radius:4px;font-size:13px}}
           .ftr{{background:#f8f8f8;text-align:center;padding:12px;font-size:11px;color:#aaa}}
         </style></head><body>
-          <div class="card">
-            <div class="hdr"><h1>🔴 Server Down Alert</h1><p style="margin:6px 0 0">Immediate attention required</p></div>
-            <div class="body">
+          <div class='card'>
+            <div class='hdr'><h1>Server Down Alert</h1><p style='margin:6px 0 0'>Immediate attention required</p></div>
+            <div class='body'>
               <p>The following server has been detected as <strong>DOWN</strong>:</p>
               <table>
                 <tr><td>Server Name</td><td>{server.Name}</td></tr>
                 <tr><td>Host</td><td>{server.Host}</td></tr>
                 <tr><td>Port</td><td>{server.Port}</td></tr>
                 <tr><td>Protocol</td><td>{server.Protocol}</td></tr>
-                <tr><td>Status</td><td><span class="badge">DOWN</span></td></tr>
-                <tr><td>Error</td><td style="color:#c0392b">{result.ErrorMessage ?? "No response received"}</td></tr>
+                <tr><td>Status</td><td><span class='badge'>DOWN</span></td></tr>
+                <tr><td>Error</td><td style='color:#c0392b'>{result.ErrorMessage ?? "No response received"}</td></tr>
                 <tr><td>HTTP Code</td><td>{(result.HttpStatusCode.HasValue ? result.HttpStatusCode.ToString() : "N/A")}</td></tr>
                 <tr><td>Response Time</td><td>{result.ResponseTimeMs} ms</td></tr>
                 <tr><td>Detected At (UTC)</td><td>{result.CheckedAt:yyyy-MM-dd HH:mm:ss}</td></tr>
               </table>
-              <div class="note">⚠️ Please investigate immediately. Check server logs, network connectivity, and running services.</div>
+              <div class='note'>Please investigate immediately. Check server logs, network, and running services.</div>
             </div>
-            <div class="ftr">Generated by Server Monitor · {DateTime.UtcNow:yyyy}</div>
+            <div class='ftr'>Generated by Server Monitor</div>
           </div>
-        </body></html>
-        """;
+        </body></html>";
 
     private static string BuildRecoveryBody(ServerConfig server, CheckResult result, TimeSpan downtime)
     {
@@ -566,7 +569,7 @@ public class EmailSender
                   : downtime.TotalHours   < 1 ? $"{downtime.TotalMinutes:F0} minutes"
                   : $"{downtime.TotalHours:F1} hours";
 
-        return $"""
+        return $@"
         <!DOCTYPE html><html><head><style>
           body{{font-family:'Segoe UI',Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px}}
           .card{{background:#fff;border-radius:8px;max-width:580px;margin:auto;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.12)}}
@@ -576,27 +579,26 @@ public class EmailSender
           table{{width:100%;border-collapse:collapse;margin-top:12px}}
           td{{padding:9px 12px;border-bottom:1px solid #eee;font-size:14px}}
           td:first-child{{font-weight:bold;color:#555;width:38%}}
-          .badge{{background:#1e8449;color:#fff;border-radius:4px;padding:3px 9px;font-size:12px;font-weight:bold}}
+          .badge{{background:#1e8449;color:#fff;border-radius:4px;padding:3px 9px;font-size:12px}}
           .ftr{{background:#f8f8f8;text-align:center;padding:12px;font-size:11px;color:#aaa}}
         </style></head><body>
-          <div class="card">
-            <div class="hdr"><h1>✅ Server Recovered</h1><p style="margin:6px 0 0">Service has been restored</p></div>
-            <div class="body">
-              <p>Good news! The following server has <strong>recovered</strong> and is back online:</p>
+          <div class='card'>
+            <div class='hdr'><h1>Server Recovered</h1><p style='margin:6px 0 0'>Service has been restored</p></div>
+            <div class='body'>
+              <p>The following server has <strong>recovered</strong> and is back online:</p>
               <table>
                 <tr><td>Server Name</td><td>{server.Name}</td></tr>
                 <tr><td>Host</td><td>{server.Host}</td></tr>
                 <tr><td>Port</td><td>{server.Port}</td></tr>
                 <tr><td>Protocol</td><td>{server.Protocol}</td></tr>
-                <tr><td>Status</td><td><span class="badge">UP</span></td></tr>
+                <tr><td>Status</td><td><span class='badge'>UP</span></td></tr>
                 <tr><td>Response Time</td><td>{result.ResponseTimeMs} ms</td></tr>
                 <tr><td>Total Downtime</td><td>{dtStr}</td></tr>
                 <tr><td>Recovered At (UTC)</td><td>{result.CheckedAt:yyyy-MM-dd HH:mm:ss}</td></tr>
               </table>
             </div>
-            <div class="ftr">Generated by Server Monitor · {DateTime.UtcNow:yyyy}</div>
+            <div class='ftr'>Generated by Server Monitor</div>
           </div>
-        </body></html>
-        """;
+        </body></html>";
     }
 }
