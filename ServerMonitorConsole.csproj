@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>ServerMonitorConsole</RootNamespace>
+    <AssemblyName>ServerMonitor</AssemblyName>
+    <!-- Self-contained single exe: dotnet publish -c Release -r win-x64 --self-contained -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.0" />
+    <PackageReference Include="MailKit"                  Version="4.3.0" />
+    <PackageReference Include="MimeKit"                  Version="4.3.0" />
+  </ItemGroup>
+
+</Project>
